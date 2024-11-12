@@ -1,0 +1,1617 @@
+main.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'my_app_state.dart';
+import 'pages/my_home_page.dart';
+import 'utils/theme_utils.dart';
+
+void main() {
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ChangeNotifierProvider(
+      create: (context) => MyAppState(),
+      child: MaterialApp(
+        title: 'Home App',
+        theme: buildAppTheme(),
+        home: MyHomePage(),
+      ),
+    );
+  }
+}
+
+
+my_app_state.dart
+import 'dart:io';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'models/project_info.dart';
+import 'utils/file_utils.dart';
+import 'utils/dialog_utils.dart';
+
+class MyAppState extends ChangeNotifier {
+  String? currentProject = 'No project';
+  List<ProjectInfo> projects = [];
+  Map<String, dynamic> processedData = {};
+  String searchQuery = '';  // Agregado para gestionar la búsqueda
+
+  MyAppState() {
+    _loadProjects();
+  }
+
+  void _loadProjects() {
+    projects = loadProjects();
+    notifyListeners();
+  }
+
+  void createNewProject(BuildContext context) async {
+    String? projectName = await showProjectNameDialog(context);
+    if (projectName != null && projectName.isNotEmpty) {
+      createProject(projectName);
+      _loadProjects();
+    }
+  }
+
+  Future<void> processCSV(BuildContext context) async {
+    if (currentProject == 'No project') {
+      showSnackBar(context, 'No project is currently open. Please create or open a project first.');
+      return;
+    }
+
+    File? file = await pickCSVFile();
+    if (file != null) {
+      await _runPythonScript(file.path);
+    } else {
+      showSnackBar(context, 'No CSV file selected.');
+    }
+  }
+
+  Future<void> _runPythonScript(String csvFilePath) async {
+    try {
+      String pythonScriptPath = 'projects/$currentProject/analysis/make_plots.py';
+      ProcessResult result = await Process.run('python3', [pythonScriptPath, csvFilePath]);
+
+      if (result.exitCode == 0) {
+        processedData = jsonDecode(result.stdout);
+        notifyListeners();
+      } else {
+        throw Exception('Python script failed: ${result.stderr}');
+      }
+    } catch (e) {
+      print('Error executing Python script: $e');
+    }
+  }
+
+  void deleteProject(ProjectInfo project, BuildContext context) async {
+    bool confirmed = await confirmDeletion(context);
+    if (confirmed) {
+      deleteProjectFromFileSystem(project);
+      _loadProjects();
+      if (currentProject == project.name) {
+        currentProject = 'No project';
+      }
+    }
+  }
+
+  void importData(BuildContext context) async {
+    if (currentProject == 'No project') {
+      showSnackBar(context, 'No project is currently open. Please create or open a project first.');
+      return;
+    }
+
+    File? file = await pickCSVFile();
+    if (file != null) {
+      importCSVFile(file, currentProject!);
+      _loadProjects();
+    }
+  }
+
+  void setSelectedProject(String projectName) {
+    currentProject = projectName;
+    notifyListeners();
+  }
+
+  // Método añadido para actualizar la consulta de búsqueda
+  void updateSearchQuery(String query) {
+    searchQuery = query;
+    notifyListeners();
+  }
+
+  // Método añadido para obtener los proyectos filtrados
+  List<ProjectInfo> get filteredProjects {
+    if (searchQuery.isEmpty) {
+      return projects;
+    }
+    return projects.where((project) {
+      return project.name.toLowerCase().contains(searchQuery.toLowerCase());
+    }).toList();
+  }
+}
+
+
+project_info.dart
+class ProjectInfo {
+  final String name;
+  final DateTime creationDate;
+  final int size;
+  final String type;
+
+  ProjectInfo({
+    required this.name,
+    required this.creationDate,
+    required this.size,
+    required this.type,
+  });
+}
+
+
+analysis_page.dart
+import 'package:flutter/material.dart';
+import 'package:csv/csv.dart';
+import 'dart:async';
+import 'dart:io';
+import 'package:syncfusion_flutter_charts/charts.dart';
+import 'package:intl/intl.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:provider/provider.dart';
+import 'package:path/path.dart' as path;
+import '../my_app_state.dart';
+
+class DataExplorerPage extends StatefulWidget {
+  @override
+  _DataExplorerPageState createState() => _DataExplorerPageState();
+}
+
+class _DataExplorerPageState extends State<DataExplorerPage> with SingleTickerProviderStateMixin {
+  List<LineSeries<dynamic, DateTime>> _chartData = [];
+  List<StackedBarSeries<dynamic, String>> _barChartData = [];
+  List<StackedAreaSeries<dynamic, DateTime>> _stackedAreaData = [];
+  List<ScatterSeries<dynamic, double>> _scatterData = [];
+  List<PieSeries<dynamic, String>> _pieChartDataConsumption = [];
+  List<PieSeries<dynamic, String>> _pieChartDataProduction = [];
+  bool _loading = true;
+  DateTimeRange? _selectedDateRange;
+  TabController? _tabController;
+
+  String _llmResponse = "Please select a chart to analyze.";
+  final TextEditingController _llmInputController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    _tabController = TabController(length: 6, vsync: this);
+    _loadCSVData();
+  }
+
+  @override
+  void dispose() {
+    _tabController?.dispose();
+    _llmInputController.dispose();
+    super.dispose();
+  }
+
+  String _getCurrentChartType() {
+    switch (_tabController!.index) {
+      case 0:
+        return 'Line Chart';
+      case 1:
+        return 'Bar Chart';
+      case 2:
+        return 'Stacked Area';
+      case 3:
+        return 'Scatter Plot';
+      case 4:
+        return 'Consumption Pie';
+      case 5:
+        return 'Production Pie';
+      default:
+        return 'Line Chart';
+    }
+  }
+
+  Future<void> _loadCSVData() async {
+    try {
+      final appState = context.read<MyAppState>();
+      if (appState.currentProject == null || appState.currentProject == 'No project') {
+        print("No project is currently active.");
+        return;
+      }
+
+      // Load CSV file from the data directory
+      final dataDir = Directory(path.join(Directory.current.path, 'projects', appState.currentProject!, 'Data'));
+
+      if (!await dataDir.exists()) {
+        print("Data directory not found.");
+        return;
+      }
+
+      final csvFiles = dataDir
+          .listSync()
+          .where((file) => file.path.endsWith('.csv'))
+          .toList();
+
+      if (csvFiles.isEmpty) {
+        print("No CSV files found.");
+        return;
+      }
+
+      // Get the most recent CSV file
+      csvFiles.sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+      final latestCsvFile = csvFiles.first;
+      final file = File(latestCsvFile.path);
+
+      if (!await file.exists()) {
+        print("CSV file not found.");
+        return;
+      }
+
+      final csvString = await file.readAsString();
+      List<List<dynamic>> csvTable = CsvToListConverter().convert(csvString);
+
+      // Prepare seriesData for consumption/production data
+      Map<String, List<Map<String, dynamic>>> seriesData = {};
+      Map<String, double> totalProduction = {};
+      Map<String, double> totalConsumption = {};
+
+      for (var header in csvTable[0]) {
+        if (header.endsWith('_consumption')) {
+          String buildingName = header.replaceAll('_consumption', '');
+          seriesData[header] = [];
+          totalConsumption[buildingName] = 0;
+        } else if (header.endsWith('_production')) {
+          String buildingName = header.replaceAll('_production', '');
+          seriesData[header] = [];
+          totalProduction[buildingName] = 0;
+        }
+      }
+
+      int maxPoints = 1000; // New limit to ensure faster loading
+      for (var i = 1; i < csvTable.length; i++) {
+        if (i > maxPoints) break;
+        var row = csvTable[i];
+        DateTime timestamp = DateTime.parse(row[0]);
+
+        if (_selectedDateRange != null &&
+            (timestamp.isBefore(_selectedDateRange!.start) || timestamp.isAfter(_selectedDateRange!.end))) {
+          continue;
+        }
+
+        for (var header in seriesData.keys) {
+          double value = double.tryParse(row[csvTable[0].indexOf(header)].toString()) ?? 0.0;
+          seriesData[header]!.add({'timestamp': timestamp, 'value': value});
+
+          if (header.endsWith('_consumption')) {
+            String buildingName = header.replaceAll('_consumption', '');
+            totalConsumption[buildingName] = totalConsumption[buildingName]! + value;
+          } else if (header.endsWith('_production')) {
+            String buildingName = header.replaceAll('_production', '');
+            totalProduction[buildingName] = totalProduction[buildingName]! + value;
+          }
+        }
+      }
+
+      // Prepare LineSeries data
+      List<LineSeries<dynamic, DateTime>> chartData = [];
+      Color? currentColor;
+      for (var entry in seriesData.entries) {
+        bool isProduction = entry.key.endsWith('_production');
+        if (isProduction) {
+          chartData.add(
+            LineSeries<dynamic, DateTime>(
+              dataSource: entry.value,
+              xValueMapper: (data, _) => data['timestamp'] as DateTime,
+              yValueMapper: (data, _) => data['value'] as double,
+              name: entry.key,
+              dashArray: <double>[5, 5],
+              width: 2,
+            ),
+          );
+        } else {
+          currentColor = Colors.primaries[chartData.length % Colors.primaries.length];
+          chartData.add(
+            LineSeries<dynamic, DateTime>(
+              dataSource: entry.value,
+              xValueMapper: (data, _) => data['timestamp'] as DateTime,
+              yValueMapper: (data, _) => data['value'] as double,
+              name: entry.key,
+              color: currentColor,
+              width: 2,
+            ),
+          );
+        }
+      }
+
+      // Prepare BarSeries and other data types
+      List<StackedBarSeries<dynamic, String>> barChartData = [
+        StackedBarSeries<dynamic, String>(
+          dataSource: totalProduction.entries.map((entry) => {'building': entry.key, 'value': entry.value}).toList(),
+          xValueMapper: (data, _) => data['building'] as String,
+          yValueMapper: (data, _) => data['value'] as double,
+          name: 'Production',
+          color: Colors.green,
+        ),
+        StackedBarSeries<dynamic, String>(
+          dataSource: totalConsumption.entries.map((entry) => {'building': entry.key, 'value': entry.value}).toList(),
+          xValueMapper: (data, _) => data['building'] as String,
+          yValueMapper: (data, _) => -data['value'] as double,
+          name: 'Consumption',
+          color: Colors.red,
+        ),
+      ];
+
+      List<StackedAreaSeries<dynamic, DateTime>> stackedAreaData = chartData.map((series) {
+        return StackedAreaSeries<dynamic, DateTime>(
+          dataSource: series.dataSource,
+          xValueMapper: (data, _) => data['timestamp'] as DateTime,
+          yValueMapper: (data, _) => data['value'] as double,
+          name: series.name,
+        );
+      }).toList();
+
+      List<ScatterSeries<dynamic, double>> scatterData = [
+        ScatterSeries<dynamic, double>(
+          dataSource: seriesData.entries.map((entry) {
+            var values = entry.value;
+            return {'x': values.first['value'] as double, 'y': values.last['value'] as double};
+          }).toList(),
+          xValueMapper: (data, _) => data['x'] as double,
+          yValueMapper: (data, _) => data['y'] as double,
+          name: 'Production vs Consumption',
+          markerSettings: MarkerSettings(isVisible: true),
+        ),
+      ];
+
+      double totalConsumptionValue = totalConsumption.values.reduce((a, b) => a + b);
+      double totalProductionValue = totalProduction.values.reduce((a, b) => a + b);
+
+      List<PieSeries<dynamic, String>> pieChartDataConsumption = [
+        PieSeries<dynamic, String>(
+          dataSource: totalConsumption.entries.map((entry) => {'building': entry.key, 'value': (entry.value / totalConsumptionValue) * 100}).toList(),
+          xValueMapper: (data, _) => data['building'] as String,
+          yValueMapper: (data, _) => data['value'] as double,
+          dataLabelMapper: (data, _) => '${data['value']!.toStringAsFixed(1)}%',
+          dataLabelSettings: DataLabelSettings(isVisible: true),
+          name: 'Annual Consumption',
+        ),
+      ];
+
+      List<PieSeries<dynamic, String>> pieChartDataProduction = [
+        PieSeries<dynamic, String>(
+          dataSource: totalProduction.entries.map((entry) => {'building': entry.key, 'value': (entry.value / totalProductionValue) * 100}).toList(),
+          xValueMapper: (data, _) => data['building'] as String,
+          yValueMapper: (data, _) => data['value'] as double,
+          dataLabelMapper: (data, _) => '${data['value']!.toStringAsFixed(1)}%',
+          dataLabelSettings: DataLabelSettings(isVisible: true),
+          name: 'Annual Production',
+        ),
+      ];
+
+      setState(() {
+        _chartData = chartData;
+        _barChartData = barChartData;
+        _stackedAreaData = stackedAreaData;
+        _scatterData = scatterData;
+        _pieChartDataConsumption = pieChartDataConsumption;
+        _pieChartDataProduction = pieChartDataProduction;
+        _loading = false;
+      });
+    } catch (e) {
+      print("Error reading the CSV file: $e");
+      setState(() {
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _selectDateRange(BuildContext context) async {
+    final DateTimeRange? picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime.now().subtract(Duration(days: 30)), // One month ago
+      lastDate: DateTime.now(), // Current date
+      initialDateRange: _selectedDateRange,
+    );
+    if (picked != null && picked != _selectedDateRange) {
+      setState(() {
+        _selectedDateRange = picked;
+        _loading = true;
+      });
+      await _loadCSVData();
+    }
+  }
+
+  Future<void> _analyzeChartData(String chartType) async {
+    final data = _getCurrentChartData(chartType);
+    final response = await _sendDataToLLM(data, chartType);
+
+    setState(() {
+      _llmResponse = response;
+    });
+  }
+
+  List<Map<String, dynamic>> _getCurrentChartData(String chartType) {
+    List<Map<String, dynamic>> convertedData = [];
+
+    switch (chartType) {
+      case 'Line Chart':
+        if (_chartData.isNotEmpty) {
+          convertedData = _chartData.first.dataSource.map((data) {
+            return {
+              'timestamp': (data['timestamp'] as DateTime).toIso8601String(),
+              'value': data['value'],
+            };
+          }).toList();
+        }
+        break;
+      case 'Bar Chart':
+        if (_barChartData.isNotEmpty) {
+          convertedData = _barChartData.first.dataSource.map((data) {
+            return {
+              'building': data['building'],
+              'value': data['value'],
+            };
+          }).toList();
+        }
+        break;
+      case 'Stacked Area':
+        if (_stackedAreaData.isNotEmpty) {
+          convertedData = _stackedAreaData.first.dataSource.map((data) {
+            return {
+              'timestamp': (data['timestamp'] as DateTime).toIso8601String(),
+              'value': data['value'],
+            };
+          }).toList();
+        }
+        break;
+      case 'Scatter Plot':
+        if (_scatterData.isNotEmpty) {
+          convertedData = _scatterData.first.dataSource.map((data) {
+            return {
+              'x': data['x'],
+              'y': data['y'],
+            };
+          }).toList();
+        }
+        break;
+      case 'Consumption Pie':
+        if (_pieChartDataConsumption.isNotEmpty) {
+          convertedData = _pieChartDataConsumption.first.dataSource?.map<Map<String, dynamic>>((data) {
+            return {
+              'building': data['building'],
+              'value': data['value'],
+            };
+          }).toList() ?? [];
+        }
+        break;
+      case 'Production Pie':
+        if (_pieChartDataProduction.isNotEmpty) {
+          convertedData = _pieChartDataProduction.first.dataSource?.map<Map<String, dynamic>>((data) {
+            return {
+              'building': data['building'],
+              'value': data['value'],
+            };
+          }).toList() ?? [];
+        }
+        break;
+      default:
+        break;
+    }
+
+    return convertedData;
+  }
+
+  Future<String> _sendDataToLLM(List<Map<String, dynamic>> data, String chartType) async {
+    final chartInfo = {
+      'chartType': chartType,
+      'xAxis': 'Date and Time (UTC)',
+      'yAxis': 'Energy (kWh)',
+    };
+
+    final url = Uri.parse('http://localhost:1234/v1/chat/completions');
+    final body = jsonEncode({
+      "model": "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "messages": [
+        {"role": "user", "content": "Analyze the following data and consider that the x-axis represents ${chartInfo['xAxis']} and the y-axis represents ${chartInfo['yAxis']}: ${jsonEncode(data)}. The data is always energy demmand. Summarize the results in 3 main evaluation keypoints."}
+      ]
+    });
+
+    try {
+      final response = await http.post(url, body: body, headers: {"Content-Type": "application/json"});
+      if (response.statusCode == 200) {
+        final jsonResponse = jsonDecode(response.body);
+        return jsonResponse['choices'][0]['message']['content'];
+      } else {
+        return "Error: ${response.reasonPhrase}";
+      }
+    } catch (e) {
+      return "Error: $e";
+    }
+  }
+
+  Future<void> _sendCustomQuery() async {
+    final query = _llmInputController.text;
+    if (query.isEmpty) return;
+
+    final url = Uri.parse('http://localhost:1234/v1/chat/completions');
+    final body = jsonEncode({
+      "model": "lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+      "messages": [
+        {"role": "user", "content": query}
+      ]
+    });
+
+    try {
+      final response = await http.post(url, body: body, headers: {"Content-Type": "application/json"});
+      if (response.statusCode == 200) {
+        final jsonResponse = jsonDecode(response.body);
+        setState(() {
+          _llmResponse = jsonResponse['choices'][0]['message']['content'];
+        });
+      } else {
+        setState(() {
+          _llmResponse = "Error: ${response.reasonPhrase}";
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _llmResponse = "Error: $e";
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Energy Data Explorer'),
+        bottom: TabBar(
+          controller: _tabController,
+          tabs: [
+            Tab(text: 'Line Chart'),
+            Tab(text: 'Bar Chart'),
+            Tab(text: 'Stacked Area'),
+            Tab(text: 'Scatter Plot'),
+            Tab(text: 'Consumption Pie'),
+            Tab(text: 'Production Pie'),
+          ],
+        ),
+      ),
+      body: FutureBuilder(
+        future: _loadCSVData(),
+        builder: (context, snapshot) {
+          if (_loading) {
+            return Center(child: CircularProgressIndicator());
+          } else if (snapshot.hasError) {
+            return Center(child: Text("Error loading data"));
+          } else {
+            return TabBarView(
+              controller: _tabController,
+              children: [
+                _buildChartCard('Line Chart', SfCartesianChart(
+                  title: ChartTitle(text: 'Energy Consumption and Production by Building'),
+                  legend: Legend(isVisible: true, position: LegendPosition.bottom),
+                  tooltipBehavior: TooltipBehavior(enable: true),
+                  zoomPanBehavior: ZoomPanBehavior(
+                    enablePanning: true,
+                    enablePinching: true,
+                    enableMouseWheelZooming: true,
+                    zoomMode: ZoomMode.xy,
+                  ),
+                  primaryXAxis: DateTimeAxis(
+                    majorGridLines: MajorGridLines(width: 0),
+                    intervalType: DateTimeIntervalType.hours,
+                    dateFormat: DateFormat.yMd().add_Hm(),
+                    title: AxisTitle(text: 'Date and Time'),
+                  ),
+                  primaryYAxis: NumericAxis(
+                    labelFormat: '{value} kWh',
+                    title: AxisTitle(text: 'Energy (kWh)'),
+                  ),
+                  series: _chartData,
+                )),
+                _buildChartCard('Bar Chart', SfCartesianChart(
+                  title: ChartTitle(text: 'Annual Production and Consumption by Building'),
+                  legend: Legend(isVisible: true, position: LegendPosition.bottom),
+                  primaryXAxis: CategoryAxis(
+                    title: AxisTitle(text: 'Building'),
+                  ),
+                  primaryYAxis: NumericAxis(
+                    labelFormat: '{value} kWh',
+                    title: AxisTitle(text: 'Energy (kWh)'),
+                    axisLine: AxisLine(width: 0),
+                    majorGridLines: MajorGridLines(width: 0.5),
+                  ),
+                  series: _barChartData,
+                )),
+                _buildChartCard('Stacked Area', SfCartesianChart(
+                  title: ChartTitle(text: 'Energy Contribution by Building Over Time'),
+                  legend: Legend(isVisible: true, 
+                  position: LegendPosition.bottom),
+                  tooltipBehavior: TooltipBehavior(enable: true),
+                  zoomPanBehavior: ZoomPanBehavior(
+                    enablePanning: true,
+                    enablePinching: true,
+                    enableMouseWheelZooming: true,
+                    zoomMode: ZoomMode.xy,
+                  ),
+                  primaryXAxis: DateTimeAxis(
+                    majorGridLines: MajorGridLines(width: 0),
+                    intervalType: DateTimeIntervalType.hours,
+                    dateFormat: DateFormat.yMd().add_Hm(),
+                    title: AxisTitle(text: 'Date and Time'),
+                  ),
+                  primaryYAxis: NumericAxis(
+                    labelFormat: '{value} kWh',
+                    title: AxisTitle(text: 'Energy (kWh)'),
+                  ),
+                  series: _stackedAreaData,
+                )),
+                _buildChartCard('Scatter Plot', SfCartesianChart(
+                  title: ChartTitle(text: 'Production vs Consumption Scatter Plot'),
+                  legend: Legend(isVisible: true, position: LegendPosition.bottom),
+                  primaryXAxis: NumericAxis(
+                    title: AxisTitle(text: 'Consumption (kWh)'),
+                  ),
+                  primaryYAxis: NumericAxis(
+                    labelFormat: '{value} kWh',
+                    title: AxisTitle(text: 'Production (kWh)'),
+                    axisLine: AxisLine(width: 0),
+                    majorGridLines: MajorGridLines(width: 0.5),
+                  ),
+                  series: _scatterData,
+                )),
+                _buildChartCard('Consumption Pie', SfCircularChart(
+                  title: ChartTitle(text: 'Annual Consumption Distribution'),
+                  legend: Legend(isVisible: true),
+                  series: _pieChartDataConsumption,
+                )),
+                _buildChartCard('Production Pie', SfCircularChart(
+                  title: ChartTitle(text: 'Annual Production Distribution'),
+                  legend: Legend(isVisible: true),
+                  series: _pieChartDataProduction,
+                )),
+              ],
+            );
+          }
+        },
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _selectDateRange(context),
+        tooltip: 'Select Date Range',
+        child: Icon(Icons.date_range),
+      ),
+    );
+  }
+
+  Widget _buildChartCard(String chartType, Widget chartWidget) {
+    return Row(
+      children: [
+        Expanded(
+          flex: 2,
+          child: Card(
+            elevation: 4,
+            margin: EdgeInsets.all(10),
+            child: Padding(
+              padding: EdgeInsets.all(10),
+              child: chartWidget,
+            ),
+          ),
+        ),
+        Expanded(
+          flex: 1,
+          child: Card(
+            elevation: 4,
+            margin: EdgeInsets.all(10),
+            child: Padding(
+              padding: EdgeInsets.all(10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    "LLM Evaluation",
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                  SizedBox(height: 10),
+                  Expanded(
+                    child: SingleChildScrollView(
+                      child: RichText(
+                        text: TextSpan(
+                          style: TextStyle(fontSize: 14, color: Colors.black),
+                          children: _buildRichText(_llmResponse),
+                        ),
+                      ),
+                    ),
+                  ),
+                  SizedBox(height: 10),
+                  TextField(
+                    controller: _llmInputController,
+                    decoration: InputDecoration(
+                      hintText: "Ask the LLM...",
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  SizedBox(height: 10),
+                  Row(
+                    children: [
+                      IconButton(
+                        onPressed: () => _analyzeChartData(chartType),
+                        icon: Icon(Icons.refresh),
+                        tooltip: 'Refresh Analysis',
+                      ),
+                      IconButton(
+                        onPressed: _sendCustomQuery,
+                        icon: Icon(Icons.send),
+                        tooltip: 'Send Custom Query',
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  List<TextSpan> _buildRichText(String text) {
+    final RegExp boldRegex = RegExp(r"\*\*(.*?)\*\*");
+    List<TextSpan> spans = [];
+    int lastIndex = 0;
+
+    for (var match in boldRegex.allMatches(text)) {
+      if (match.start != lastIndex) {
+        spans.add(TextSpan(text: text.substring(lastIndex, match.start)));
+      }
+      spans.add(TextSpan(
+        text: match.group(1),
+        style: TextStyle(fontWeight: FontWeight.bold),
+      ));
+      lastIndex = match.end;
+    }
+    if (lastIndex != text.length) {
+      spans.add(TextSpan(text: text.substring(lastIndex)));
+    }
+    return spans;
+  }
+}
+
+
+favorites_page.dart
+import 'package:flutter/material.dart';
+
+class FavoritesPage extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Text('This functionality is not implemented yet.'),
+    );
+  }
+}
+
+
+home_page.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../my_app_state.dart';
+
+class HomePage extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        image: DecorationImage(
+          image: AssetImage('assets/images/pattern_overlay_5.png'),
+          repeat: ImageRepeat.repeat,
+          opacity: 0.02,
+          fit: BoxFit.none,
+        ),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Text(
+              'This is a test app from ARCbcn Innovation Department',
+              style: TextStyle(fontSize: 24),
+              textAlign: TextAlign.center,
+            ),
+            SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: () => context.read<MyAppState>().createNewProject(context),
+              child: Text('New Project'),
+            ),
+            SizedBox(height: 10),
+            ElevatedButton(
+              onPressed: () => context.read<MyAppState>().importData(context),
+              child: Text('Open Project'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+model_page.dart
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+// Importa ModelInfo si está en un archivo separado
+// import '../models/model_info.dart';
+
+class ModelInfo {
+  final String name;
+  final Map<String, double> variables;
+
+  ModelInfo({required this.name, required this.variables});
+}
+
+class ModelPage extends StatefulWidget {
+  @override
+  _ModelPageState createState() => _ModelPageState();
+}
+
+class _ModelPageState extends State<ModelPage> {
+  final List<ModelInfo> _models = [
+    ModelInfo(
+      name: 'Electric BESS and LEC optimizer',
+      variables: {
+        'price_energy_from_grid': 0.15,
+        'price_energy_to_grid': 0.2,
+        'price_battery': 550.0,
+        'price_PV': 600.0,
+        'maintenance_price_450': 2500.0,
+      },
+    ),
+    ModelInfo(
+      name: 'DHC-TES tecno-economic optimization',
+      variables: {
+        'variable1': 100.0,
+        'variable2': 200.0,
+      },
+    ),
+    // Agrega más modelos según sea necesario
+  ];
+
+  void _openModelDialog(ModelInfo model) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return ModelDialog(
+          model: model,
+          onRunModel: _runModel,
+        );
+      },
+    );
+  }
+
+  Future<void> _runModel(ModelInfo model) async {
+    String endpoint;
+    if (model.name == 'Modelo de Optimización Energética') {
+      endpoint = 'http://127.0.0.1:8000/optimize/';
+    } else if (model.name == 'Modelo de Pronóstico de Demanda') {
+      endpoint = 'http://127.0.0.1:8000/forecast/';
+    } else {
+      endpoint = 'http://127.0.0.1:8000/default/';
+    }
+    final url = Uri.parse(endpoint);
+    final body = jsonEncode(model.variables);
+
+    try {
+      final response = await http.post(url, body: body, headers: {"Content-Type": "application/json"});
+      if (response.statusCode == 200) {
+        // Maneja la respuesta del API
+        final apiResponse = jsonDecode(response.body);
+        // Puedes mostrar los resultados o almacenarlos según necesites
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Modelo ejecutado con éxito.')));
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: ${response.reasonPhrase}')));
+      }
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Modelos de Optimización'),
+      ),
+      body: GridView.builder(
+        padding: EdgeInsets.all(16.0),
+        itemCount: _models.length,
+        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: MediaQuery.of(context).size.width > 600 ? 3 : 1,
+          childAspectRatio: 3 / 2,
+          mainAxisSpacing: 16.0,
+          crossAxisSpacing: 16.0,
+        ),
+        itemBuilder: (context, index) {
+          final model = _models[index];
+          return GestureDetector(
+            onTap: () => _openModelDialog(model),
+            child: Card(
+              elevation: 4.0,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16.0),
+              ),
+              child: Center(
+                child: Text(
+                  model.name,
+                  style: TextStyle(fontSize: 24.0),
+                  textAlign: TextAlign.center,
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class ModelDialog extends StatefulWidget {
+  final ModelInfo model;
+  final Function(ModelInfo) onRunModel;
+
+  ModelDialog({required this.model, required this.onRunModel});
+
+  @override
+  _ModelDialogState createState() => _ModelDialogState();
+}
+
+class _ModelDialogState extends State<ModelDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late Map<String, TextEditingController> _controllers;
+
+  @override
+  void initState() {
+    super.initState();
+    _controllers = {
+      for (var entry in widget.model.variables.entries)
+        entry.key: TextEditingController(text: entry.value.toString()),
+    };
+  }
+
+  @override
+  void dispose() {
+    for (var controller in _controllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  void _runModel() {
+    if (_formKey.currentState!.validate()) {
+      // Actualiza los valores del modelo con los nuevos valores del formulario
+      widget.model.variables.updateAll((key, value) => double.parse(_controllers[key]!.text));
+      widget.onRunModel(widget.model);
+      Navigator.of(context).pop(); // Cierra el diálogo
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Variables del ${widget.model.name}'),
+      content: SingleChildScrollView(
+        child: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: _controllers.entries.map((entry) {
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8.0),
+                child: TextFormField(
+                  controller: entry.value,
+                  decoration: InputDecoration(
+                    labelText: entry.key,
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.numberWithOptions(decimal: true),
+                  validator: (value) {
+                    if (value == null || value.isEmpty) {
+                      return 'Por favor ingresa un valor';
+                    }
+                    return null;
+                  },
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(), // Cierra el diálogo
+          child: Text('Cancelar'),
+        ),
+        ElevatedButton(
+          onPressed: _runModel,
+          child: Text('Ejecutar Modelo'),
+        ),
+      ],
+    );
+  }
+}
+
+
+my_home_page.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'home_page.dart';
+import 'project_page.dart';
+import 'model_page.dart';
+import 'analysis_page.dart';
+import 'favorites_page.dart';
+import '../my_app_state.dart';
+import '../widgets/custom_app_bar.dart';
+import '../widgets/custom_navigation_rail.dart';
+
+class MyHomePage extends StatefulWidget {
+  @override
+  State<MyHomePage> createState() => _MyHomePageState();
+}
+
+class _MyHomePageState extends State<MyHomePage> {
+  var selectedIndex = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    var appState = context.watch<MyAppState>();
+
+    Widget page;
+    switch (selectedIndex) {
+      case 0:
+        page = HomePage();
+      case 1:
+        page = ProjectPage();
+      case 2:
+        page = ModelPage();
+      case 3:
+        page = DataExplorerPage();
+      case 4:
+        appState.importData(context);
+        page = HomePage();
+      case 5:
+        page = FavoritesPage();
+      default:
+        page = FavoritesPage();
+        break;
+    }
+
+    return Scaffold(
+      body: Column(
+        children: [
+          CustomAppBar(selectedIndex: selectedIndex),
+          Expanded(
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                if (constraints.maxWidth < 450) {
+                  return buildMobileLayout(page);
+                } else {
+                  return buildDesktopLayout(page);
+                }
+              },
+            ),
+          ),
+          buildFooter(),
+        ],
+      ),
+    );
+  }
+
+  Widget buildMobileLayout(Widget page) {
+    return Column(
+      children: [
+        Expanded(child: page),
+        SafeArea(
+          child: BottomNavigationBar(
+            items: [
+              BottomNavigationBarItem(icon: Icon(Icons.home), label: 'Home'),
+              BottomNavigationBarItem(icon: Icon(Icons.folder), label: 'Project'),
+              BottomNavigationBarItem(icon: Icon(Icons.analytics), label: 'Model'),
+              BottomNavigationBarItem(icon: Icon(Icons.scatter_plot_sharp), label: 'Analysis'),
+              BottomNavigationBarItem(icon: Icon(Icons.input), label: 'Import'),
+              BottomNavigationBarItem(icon: Icon(Icons.output), label: 'Export'),
+            ],
+            currentIndex: selectedIndex,
+            onTap: (value) => setState(() => selectedIndex = value),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget buildDesktopLayout(Widget page) {
+    return Row(
+      children: [
+        CustomNavigationRail(selectedIndex: selectedIndex, onDestinationSelected: (value) => setState(() => selectedIndex = value)),
+        Expanded(child: page),
+      ],
+    );
+  }
+
+  Widget buildFooter() {
+    return Container(
+      width: double.infinity,
+      height: 20,
+      color: Colors.grey[200],
+      padding: EdgeInsets.all(2),
+      child: Center(
+        child: Text('© 2024 ARCbcn Innovation Department. All rights reserved.', style: TextStyle(color: Colors.black54, fontSize: 10)),
+      ),
+    );
+  }
+}
+
+
+project_page.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../my_app_state.dart';
+import '../widgets/project_card.dart';
+
+class ProjectPage extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    var appState = context.watch<MyAppState>();
+    var filteredProjects = appState.projects.where((project) {
+      return project.name.toLowerCase().contains(appState.searchQuery.toLowerCase());
+    }).toList();
+
+    return Scaffold(
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: TextField(
+              decoration: InputDecoration(
+                labelText: 'Project Finder',
+                border: OutlineInputBorder(),
+                suffixIcon: Icon(Icons.search),
+              ),
+              onChanged: (query) {
+                appState.updateSearchQuery(query);
+              },
+            ),
+          ),
+          Expanded(
+            child: GridView.builder(
+              gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: MediaQuery.of(context).size.width > 600 ? 3 : 1,
+                childAspectRatio: 3 / 2,
+              ),
+              itemCount: filteredProjects.length,
+              itemBuilder: (context, index) {
+                final project = filteredProjects[index];
+                final isSelected = project.name == appState.currentProject;
+
+                return ProjectCard(
+                  project: project,
+                  isSelected: isSelected,
+                  onTap: () => appState.setSelectedProject(project.name),
+                  onDelete: () => appState.deleteProject(project, context),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          appState.createNewProject(context);
+        },
+        tooltip: 'Crear nuevo proyecto',
+        child: Icon(Icons.add),
+      ),
+    );
+  }
+}
+
+
+chart_utils.dart
+import 'package:flutter/material.dart';
+import 'package:fl_chart/fl_chart.dart';
+
+Widget buildLineChart(List<dynamic> hourlyData) {
+  return Card(
+    child: Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: LineChart(
+        LineChartData(
+          lineBarsData: [
+            LineChartBarData(
+              spots: hourlyData.map((point) => FlSpot(point['timestamp'].toDouble(), point['value'].toDouble())).toList(),
+              isCurved: true,
+              color: Colors.blue,
+            ),
+          ],
+          titlesData: FlTitlesData(
+            bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: true)),
+            leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true)),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+Widget buildPieChart(Map<String, dynamic> annualData) {
+  return Card(
+    child: Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: PieChart(
+        PieChartData(
+          sections: annualData.entries.map((entry) {
+            return PieChartSectionData(
+              value: entry.value.toDouble(),
+              title: '${entry.key}: ${entry.value.toStringAsFixed(1)}%',
+              color: Colors.primaries[annualData.keys.toList().indexOf(entry.key) % Colors.primaries.length],
+            );
+          }).toList(),
+        ),
+      ),
+    ),
+  );
+}
+
+Widget buildBarChart(Map<String, double> kwhPerSquareMeter) {
+  return Card(
+    child: Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: BarChart(
+        BarChartData(
+          barGroups: kwhPerSquareMeter.entries.map((entry) {
+            return BarChartGroupData(
+              x: kwhPerSquareMeter.keys.toList().indexOf(entry.key),
+              barRods: [BarChartRodData(toY: entry.value, color: Colors.blue)],
+            );
+          }).toList(),
+          titlesData: FlTitlesData(
+            bottomTitles: AxisTitles(
+              sideTitles: SideTitles(
+                showTitles: true,
+                getTitlesWidget: (value, meta) => Text(kwhPerSquareMeter.keys.elementAt(value.toInt())),
+              ),
+            ),
+            leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true)),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+
+dialog_utils.dart
+import 'package:flutter/material.dart';
+
+Future<String?> showProjectNameDialog(BuildContext context) async {
+  TextEditingController textController = TextEditingController();
+
+  return await showDialog<String>(
+    context: context,
+    builder: (BuildContext context) {
+      return AlertDialog(
+        title: Text('Enter Project Name'),
+        content: TextField(
+          controller: textController,
+          decoration: InputDecoration(hintText: 'Project Name'),
+        ),
+        actions: <Widget>[
+          TextButton(
+            child: Text('Cancel'),
+            onPressed: () {
+              Navigator.of(context).pop(null);
+            },
+          ),
+          TextButton(
+            child: Text('OK'),
+            onPressed: () {
+              Navigator.of(context).pop(textController.text);
+            },
+          ),
+        ],
+      );
+    },
+  );
+}
+
+Future<bool> confirmDeletion(BuildContext context) async {
+  return await showDialog<bool>(
+    context: context,
+    builder: (context) {
+      return AlertDialog(
+        title: Text('Confirm Deletion'),
+        content: Text('Are you sure you want to delete this project?'),
+        actions: <Widget>[
+          TextButton(
+            child: Text('Cancel'),
+            onPressed: () {
+              Navigator.of(context).pop(false);
+            },
+          ),
+          TextButton(
+            child: Text('Delete'),
+            onPressed: () {
+              Navigator.of(context).pop(true);
+            },
+          ),
+        ],
+      );
+    },
+  ) ?? false;
+}
+
+void showSnackBar(BuildContext context, String message) {
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+}
+
+
+file_utils.dart
+import 'dart:io';
+import 'package:file_picker/file_picker.dart';
+import '../models/project_info.dart';
+
+List<ProjectInfo> loadProjects() {
+  final appDirectory = Directory.current;
+  final projectsDirectory = Directory('${appDirectory.path}/projects');
+  if (projectsDirectory.existsSync()) {
+    return projectsDirectory.listSync().whereType<Directory>().map((dir) {
+      final creationDate = dir.statSync().changed;
+      final size = _getDirectorySize(dir);
+      final projectName = dir.path.split(Platform.pathSeparator).last;
+      return ProjectInfo(name: projectName, creationDate: creationDate, size: size, type: 'Unknown');
+    }).toList();
+  }
+  return [];
+}
+
+int _getDirectorySize(Directory directory) {
+  int size = 0;
+  try {
+    directory.listSync(recursive: true).forEach((file) {
+      if (file is File) {
+        size += file.lengthSync();
+      }
+    });
+  } catch (e) {
+    // Handle errors
+  }
+  return size;
+}
+
+void createProject(String projectName) {
+  final appDirectory = Directory.current;
+  final projectsDirectory = Directory('${appDirectory.path}/projects');
+  if (!projectsDirectory.existsSync()) {
+    projectsDirectory.createSync(recursive: true);
+  }
+
+  final newProjectDirectory = Directory('${projectsDirectory.path}/$projectName');
+  if (!newProjectDirectory.existsSync()) {
+    newProjectDirectory.createSync(recursive: true);
+    Directory('${newProjectDirectory.path}/Data').createSync(recursive: true);
+    Directory('${newProjectDirectory.path}/Temp').createSync(recursive: true);
+    Directory('${newProjectDirectory.path}/Results').createSync(recursive: true);
+  }
+}
+
+void deleteProjectFromFileSystem(ProjectInfo project) {
+  final appDirectory = Directory.current;
+  final projectDir = Directory('${appDirectory.path}/projects/${project.name}');
+  if (projectDir.existsSync()) {
+    projectDir.deleteSync(recursive: true);
+  }
+}
+
+Future<File?> pickCSVFile() async {
+  FilePickerResult? result = await FilePicker.platform.pickFiles(
+    type: FileType.custom,
+    allowedExtensions: ['csv'],
+  );
+
+  if (result != null && result.files.single.path != null) {
+    return File(result.files.single.path!);
+  }
+  return null;
+}
+
+void importCSVFile(File file, String currentProject) {
+  final appDirectory = Directory.current;
+  final projectDir = Directory('${appDirectory.path}/projects/$currentProject');
+  final dataDir = Directory('${projectDir.path}/Data');
+  if (dataDir.existsSync()) {
+    final newFile = File('${dataDir.path}/${file.uri.pathSegments.last}');
+    file.copy(newFile.path);
+  }
+}
+
+
+theme_utils.dart
+import 'package:flutter/material.dart';
+
+ThemeData buildAppTheme() {
+  return ThemeData(
+    useMaterial3: true,
+    colorScheme: ColorScheme.fromSeed(
+      seedColor: Color(0xFF2D3C63), // Azul/Morado como color principal
+      brightness: Brightness.light, // Mantenemos un tema claro para el centro de la aplicación
+      primary: Color(0xFF2D3C63),  // Azul/Morado principal
+      secondary: Color(0xFF6C7A93), // Tono complementario más suave
+      background: Color(0xFFF1F3F6), // Fondo claro para el centro de la aplicación
+      surface: Color(0xFFF1F3F6), // Fondo de los paneles o contenedores
+      onPrimary: Colors.white,
+      onSecondary: Colors.white,
+    ),
+  );
+}
+
+
+custom_app_bar.dart
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../my_app_state.dart';
+
+class CustomAppBar extends StatelessWidget {
+  final int selectedIndex;
+
+  CustomAppBar({required this.selectedIndex});
+
+  @override
+  Widget build(BuildContext context) {
+    var appState = context.watch<MyAppState>();
+
+    return Container(
+      height: 100,
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Color(0xFF1B1E29), // Tono oscuro similar al usado en la imagen
+            Color(0xFF2D3C63), // Tono azul/morado más claro
+          ],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        image: DecorationImage(
+          image: AssetImage('assets/images/pattern_overlay.png'), // Patrón similar a los nodos de la imagen "Research & Innovation"
+          fit: BoxFit.cover,
+          opacity: 0.15, // Para que el patrón sea sutil
+        ),
+      ),
+      child: Row(
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(left: 30.0),
+            child: Image.asset(
+              'assets/images/logo_arc.png',
+              height: 100,
+            ),
+          ),
+          Spacer(),
+          if (selectedIndex == 1)
+            IconButton(
+              icon: Icon(Icons.add, color: Colors.white),
+              onPressed: () {
+                appState.createNewProject(context);
+              },
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+
+custom_navigation_rail.dart
+import 'package:flutter/material.dart';
+
+class CustomNavigationRail extends StatelessWidget {
+  final int selectedIndex;
+  final ValueChanged<int> onDestinationSelected;
+
+  CustomNavigationRail({
+    required this.selectedIndex,
+    required this.onDestinationSelected,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Container(
+        width: 200,
+        color: Theme.of(context).colorScheme.primary.withOpacity(0.1), // Fondo personalizado
+        child: NavigationRail(
+          extended: MediaQuery.of(context).size.width >= 600,
+          backgroundColor: Colors.transparent, // Elimina cualquier fondo por defecto de NavigationRail
+          destinations: [
+            NavigationRailDestination(icon: Icon(Icons.home), label: Text('Home')),
+            NavigationRailDestination(icon: Icon(Icons.folder), label: Text('Project')),
+            NavigationRailDestination(icon: Icon(Icons.analytics), label: Text('Model')),
+            NavigationRailDestination(icon: Icon(Icons.scatter_plot_sharp), label: Text('Data Explorer')),
+            NavigationRailDestination(icon: Icon(Icons.input), label: Text('Import data')),
+            NavigationRailDestination(icon: Icon(Icons.output), label: Text('Export data')),
+          ],
+          selectedIndex: selectedIndex,
+          onDestinationSelected: onDestinationSelected,
+        ),
+      ),
+    );
+  }
+}
+
+
+project_card.dart
+import 'package:flutter/material.dart';
+import '../models/project_info.dart';
+
+class ProjectCard extends StatelessWidget {
+  final ProjectInfo project;
+  final bool isSelected;
+  final VoidCallback onTap;
+  final VoidCallback onDelete;
+
+  ProjectCard({
+    required this.project,
+    required this.isSelected,
+    required this.onTap,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Card(
+        color: isSelected ? Colors.blue.shade100 : null,
+        elevation: isSelected ? 8 : 4,
+        shape: RoundedRectangleBorder(
+          side: isSelected ? BorderSide(color: Colors.blue, width: 2) : BorderSide.none,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        margin: const EdgeInsets.all(8.0),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                project.name,
+                style: TextStyle(
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                  color: isSelected ? Colors.blue : Colors.black,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
+              SizedBox(height: 8),
+              Text('Created: ${project.creationDate}'),
+              Text('Size: ${project.size ~/ (1024 * 1024)} MB'),
+              Text('Type: ${project.type}'),
+              Spacer(),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  IconButton(
+                    icon: Icon(Icons.delete, color: Colors.red),
+                    onPressed: onDelete,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
